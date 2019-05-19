@@ -64,6 +64,14 @@ if (argv._[0] === 'create') {
     if (err) return error(err)
     console.log(jobs)
   })
+} else if (argv._[0] === 'logs') {
+  var through = require('through2')
+  var sh = open()
+  sh.logs(argv._[1]).pipe(through.obj(function (row, enc, next) {
+    var w = row.worker.slice(0,8)
+    console.log(`[${w}@${row.time}] ${row.data.toString()}`)
+    next()
+  }))
 }
 
 function error (err) {

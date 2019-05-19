@@ -9,10 +9,17 @@ var duplexify = require('duplexify')
 var collect = require('collect-stream')
 
 var JOB = 'j!'
+var OUTPUT = 'o!'
+var STDOUT = '1!'
+var STDERR = '2!'
+var EXIT = '3!'
+
+var types = { 1: 'stdout', 2: 'stderr' }
 
 module.exports = Swarmhead
 
 function Swarmhead (opts) {
+  var self = this
   if (!(this instanceof Swarmhead)) return new Swarmhead(opts)
   this.hypercore = opts.hypercore
   this.swarm = opts.swarm
@@ -22,6 +29,101 @@ function Swarmhead (opts) {
     { valueEncoding: 'json' })
   this.kcore = kcore(this.storage, { multifeed: this.multi })
   this.db = opts.db
+  this.kcore.use('logs', 1, {
+    api: {
+      list: function (core, id) {
+        var d = duplexify.obj()
+        core.ready(function () {
+          var out = through.obj(function (row, enc, next) {
+            var parts = row.key.toString().split('!')
+            var type = types[parts[3]]
+            if (type === 'stdout' || type === 'stderr') {
+              next(null, {
+                type: type,
+                worker: parts[2],
+                time: parts[4],
+                data: row.value
+              })
+            } else if (type === 'exit') {
+              next(null, {
+                type: type,
+                code: Number(row.value.toString())
+              })
+            } else next()
+          })
+          d.setReadable(out)
+          pump(self.db.createReadStream({
+            gt: OUTPUT + id + '!',
+            lt: OUTPUT + id + '!\uffff',
+            keyEncoding: 'utf8',
+            valueEncoding: 'json'
+          }), out)
+        })
+        return d
+      }
+    },
+    map: function (msgs, next) {
+      var batch = []
+      msgs.forEach(function (msg) {
+        if (msg.value && msg.value.type === 'stderr') {
+          batch.push({
+            type: 'put',
+            key: OUTPUT + msg.value.job + '!' + msg.value.worker
+              + '!' + STDERR + msg.value.time,
+            value: msg.value.data
+          })
+        } else if (msg.value && msg.value.type === 'stdout') {
+          batch.push({
+            type: 'put',
+            key: OUTPUT + msg.value.job + '!' + msg.value.worker
+              + '!' + STDOUT + msg.value.time,
+            value: msg.value.data
+          })
+        } else if (msg.value && msg.value.type === 'exit') {
+          batch.push({
+            type: 'put',
+            key: OUTPUT + msg.value.job + '!' + msg.value.worker
+              + '!' + EXIT + msg.value.time,
+            value: msg.value.code
+          })
+        }
+      })
+      self.db.batch(batch, { valueEncoding: 'json' }, next)
+    }
+  })
+  self.kcore.use('jobs', 1, {
+    api: {
+      list: function () {
+        var d = duplexify.obj()
+        this.ready(function () {
+          var out = through.obj(function (row, enc, next) {
+            next(null, row.key.toString().slice(JOB.length))
+          })
+          pump(self.db.createReadStream({
+            gt: JOB,
+            lt: JOB + '\uffff',
+            keyEncoding: 'utf8',
+            valueEncoding: 'json'
+          }), out)
+          d.setReadable(out)
+        })
+        return d
+      }
+    },
+    map: function (msgs, next) {
+      var batch = []
+      msgs.forEach(function (msg) {
+        if (msg.value && msg.value.type === 'deploy') {
+          batch.push({
+            type: 'put',
+            key: JOB + msg.value.id,
+            value: 0
+          })
+        }
+      })
+      self.db.batch(batch, { valueEncoding: 'json' }, next)
+    }
+  })
 }
 
 Swarmhead.prototype.create = function (cb) {
@@ -110,16 +212,34 @@ Swarmhead.prototype.work = function (id, cb) {
       })
       var pending = 3
       ps.on('exit', function (code) {
-        feed.append({ type: 'exit', job: jobId, code: code })
+        feed.append({
+          type: 'exit',
+          job: jobId,
+          worker: feed.key.toString('hex'),
+          time: Date.now(),
+          code: code
+        })
         job.emit('exit', code)
         done()
       })
       ps.stderr.pipe(split()).pipe(through(function (buf, enc, next) {
-        feed.append({ type: 'stderr', job: jobId, data: buf.toString() })
+        feed.append({
+          type: 'stderr',
+          job: jobId,
+          worker: feed.key.toString('hex'),
+          time: Date.now(),
+          data: buf.toString()
+        })
         next()
       }, done))
       ps.stdout.pipe(split()).pipe(through(function (buf, enc, next) {
-        feed.append({ type: 'stdout', job: jobId, data: buf.toString() })
+        feed.append({
+          type: 'stdout',
+          job: jobId,
+          worker: feed.key.toString('hex'),
+          time: Date.now(),
+          data: buf.toString()
+        })
         next()
       }, done))
       function done () {
@@ -132,42 +252,20 @@ Swarmhead.prototype.work = function (id, cb) {
 Swarmhead.prototype.jobs = function (cb) {
   if (!cb) cb = noop
   var self = this
-  self.kcore.use('jobs', 1, {
-    api: {
-      list: function () {
-        var d = duplexify.obj()
-        this.ready(function () {
-          var out = through.obj(function (row, enc, next) {
-            next(null, row.key.toString().slice(JOB.length+1))
-          })
-          pump(self.db.createReadStream({
-            gt: JOB,
-            lt: JOB + '\uffff',
-            keyEncoding: 'utf8',
-            valueEncoding: 'json'
-          }), out)
-          d.setReadable(out)
-        })
-        return d
-      }
-    },
-    map: function (msgs, next) {
-      var batch = []
-      msgs.forEach(function (msg) {
-        if (msg.value && msg.value.type === 'deploy') {
-          batch.push({
-            type: 'put',
-            key: JOB + msg.value.id,
-            value: 0
-          })
-        }
-      })
-      self.db.batch(batch, { valueEncoding: 'json' }, next)
-    }
-  })
   var d = duplexify.obj()
   self.kcore.ready('jobs', function () {
     d.setReadable(self.kcore.api.jobs.list())
+  })
+  if (cb) collect(d, cb)
+  return d
+}
+
+Swarmhead.prototype.logs = function (id, cb) {
+  if (!cb) cb = noop
+  var self = this
+  var d = duplexify.obj()
+  self.kcore.ready('logs', function () {
+    d.setReadable(self.kcore.api.logs.list(id))
   })
   if (cb) collect(d, cb)
   return d
